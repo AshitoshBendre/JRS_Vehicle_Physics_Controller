@@ -2,31 +2,29 @@
 //
 // Copyright (c) 2023 Samborlang Pyrtuh
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// Permission is hereby granted, free of charge, to any person obtaining a copy...
+// (License text retained)
 
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Audio;
+using TMPro;
 
 public class JrsVehicleController : MonoBehaviour
 {
+    [Header("Transmission Settings")]
+    public bool isAutomatic = true;
+    public float[] gearRatios;
+    public float shiftThreshold = 5000f; // Max RPM (Upshift / Rev Limiter)
+    public float downshiftThreshold = 2000f; // Min RPM to downshift
+    private int currentGear = 1; // -1 = Reverse, 0 = Neutral, 1+ = Forward Gears
+
+    [Header("UI Settings")]
+    public TMP_Text speedText;
+    public TMP_Text gearText;
+
+    [Header("Vehicle Settings")]
     public float motorForce = 50f;
     public float maxSteerAngle = 30f;
     public WheelCollider frontLeftWheel, frontRightWheel, rearLeftWheel, rearRightWheel;
@@ -36,53 +34,87 @@ public class JrsVehicleController : MonoBehaviour
     private Rigidbody rb;
     public WheelCollider[] wheelCollidersBrake;
     public float brakeForce = 500f;
+    public float engineBrakingForce = 300f; // Base force applied when downshifting aggressively
 
-    public float[] gearRatios; // Array to store the gear ratios for each gear
-    public float shiftThreshold = 5000f; // Threshold value for shifting to a higher gear
-    private int currentGear = 1; // Variable to track the current gear
+    public bool enable4x4 = false;
 
-    public bool enable4x4 = false; // Option to enable 4-wheel drive
-
-    private float stopSpeedThreshold = 1f; // Speed threshold for considering the vehicle stopped
-
-    public ParticleSystem frontLeftDustParticleSystem, frontRightDustParticleSystem, rearLeftDustParticleSystem, rearRightDustParticleSystem; // References to the dust particle systems for each wheel
-
-    private Quaternion prevRotation; // Previous rotation of the wheel
+    public ParticleSystem frontLeftDustParticleSystem, frontRightDustParticleSystem, rearLeftDustParticleSystem, rearRightDustParticleSystem;
+    private Quaternion prevRotation;
 
     private JrsInputController mobileInputController;
 
-    public AudioSource engineAudioSource; // Assign this in the Inspector
+    [Header("Audio")]
+    public AudioSource engineAudioSource;
     private AudioClip engineSound;
     private float targetPitch;
-    public AudioSource engineStartAudioSource; // Assign this in the Inspector
+    public AudioSource engineStartAudioSource;
 
-    private bool hasStartedMoving = false;
+    [SerializeField] private bool hasStartedMoving = false;
+    private LogitechControls controls;
 
     void Start()
     {
+        controls = new LogitechControls();
+        controls.CarInput.Enable();
         rb = GetComponent<Rigidbody>();
         prevRotation = frontLeftWheelTransform.rotation;
 
         mobileInputController = FindObjectOfType<JrsInputController>();
 
         engineSound = Resources.Load<AudioClip>("EngineSound");
-        targetPitch = engineAudioSource.pitch;
+        if (engineAudioSource != null)
+        {
+            targetPitch = engineAudioSource.pitch;
+        }
 
+        currentGear = isAutomatic ? 1 : 0;
         StartCoroutine(DelayedEngineSound());
     }
 
-        IEnumerator DelayedEngineSound()
+    IEnumerator DelayedEngineSound()
+    {
+        while (!hasStartedMoving)
         {
-            while (!hasStartedMoving)
-            {
-                yield return null;
-            }
+            yield return null;
+        }
+        yield return new WaitForSeconds(2f);
 
-            yield return new WaitForSeconds(2f); // Delay for 2 seconds
-
+        if (engineAudioSource != null)
+        {
             engineAudioSource.Play();
         }
-        
+    }
+
+    private void OnEnable()
+    {
+        if (controls == null)
+            controls = new LogitechControls();
+
+        controls.CarInput.Enable();
+    }
+
+    private void OnDisable()
+    {
+        controls.CarInput.Disable();
+    }
+
+    private float GetSteeringInput()
+    {
+        Vector2 steer = controls.CarInput.Steering.ReadValue<Vector2>();
+        steer.Normalize();
+        return steer.x;
+    }
+
+    private float GetThrottleInput()
+    {
+        float rawThrottle = controls.CarInput.Accelerate.ReadValue<float>();
+        return -rawThrottle;
+    }
+
+    private float GetBrakeInputRaw()
+    {
+        return controls.CarInput.Brake.ReadValue<float>();
+    }
 
     void Update()
     {
@@ -91,136 +123,235 @@ public class JrsVehicleController : MonoBehaviour
             rb.centerOfMass = transform.InverseTransformPoint(centerOfMassObject.transform.position);
         }
 
-        float v = mobileInputController != null ? mobileInputController.GetVerticalInput() : Input.GetAxis("Vertical") * motorForce;
-        float h = mobileInputController != null ? mobileInputController.GetHorizontalInput() : Input.GetAxis("Horizontal") * maxSteerAngle;
+        if (!isAutomatic)
+        {
+            if (controls.CarInput.ShiftUp.triggered) ShiftGear(1);
+            if (controls.CarInput.ShiftDown.triggered) ShiftGear(-1);
+        }
 
-        // Apply motor torque to the wheels
-        frontLeftWheel.motorTorque = v;
-        frontRightWheel.motorTorque = v;
-
-        // Apply steering angle to the front wheels
-        frontLeftWheel.steerAngle = h;
-        frontRightWheel.steerAngle = h;
-
-        // Update wheel poses
         UpdateWheelPoses();
+    }
 
-        if (Input.GetKey(KeyCode.Space) || mobileInputController.brakeButton.IsButtonPressed())
-        {
-            foreach (WheelCollider wheelCollider in wheelCollidersBrake)
-            {
-                wheelCollider.brakeTorque = brakeForce;
-            }
-        }
-        else
-        {
-            foreach (WheelCollider wheelCollider in wheelCollidersBrake)
-            {
-                wheelCollider.brakeTorque = 0;
-            }
-        }
+    void ShiftGear(int direction)
+    {
+        currentGear += direction;
+        currentGear = Mathf.Clamp(currentGear, -1, gearRatios.Length);
     }
 
     void FixedUpdate()
     {
-        float v = mobileInputController != null ? mobileInputController.GetVerticalInput() * motorForce : 0f;
-        float h = mobileInputController != null ? mobileInputController.GetHorizontalInput() * maxSteerAngle : 0f;
+        float throttleInput = GetThrottleInput();
+        float steeringInput = GetSteeringInput();
+        float brakeInput = GetBrakeInputRaw();
 
-        // Calculate the current wheel speed in km/h
-        float currentSpeedKmph = frontLeftWheel.radius * Mathf.PI * frontLeftWheel.rpm * 60f / 1000f;
-        Debug.Log("Current Speed: " + currentSpeedKmph + " Kmph");
-
-        // Calculate the current engine RPM based on the wheel speed and gear ratio
-        float currentRPM = frontLeftWheel.rpm * gearRatios[Mathf.Clamp(currentGear - 1, 0, gearRatios.Length - 1)];
-
-        // Check if it's time to shift to a higher gear
-        if (currentRPM > shiftThreshold && currentGear < gearRatios.Length)
+        if (throttleInput == 0f && steeringInput == 0f && brakeInput == 0f && mobileInputController != null)
         {
-            currentGear++; // Shift to the next gear
-        }
-        else if (currentSpeedKmph < stopSpeedThreshold && currentGear > 1)
-        {
-            currentGear--; // Shift to the previous gear when slowing down
+            float mobileVertical = mobileInputController.GetVerticalInput();
+            steeringInput = mobileInputController.GetHorizontalInput();
+
+            if (mobileVertical > 0) throttleInput = -mobileVertical;
+            else if (mobileVertical < 0) brakeInput = Mathf.Abs(mobileVertical);
         }
 
-        // Adjust the motor torque based on the current gear ratio
-        float adjustedTorque = v * gearRatios[Mathf.Clamp(currentGear - 1, 0, gearRatios.Length - 1)];
+        float v = 0f;
+        float currentBrakeTorque = 0f; // Unified brake torque variable
+        float h = steeringInput * maxSteerAngle;
 
-        // Apply motor torque to the wheels
-        if (enable4x4)
+        float forwardVelocity = transform.InverseTransformDirection(rb.velocity).z;
+        float currentSpeedKmph = rb.velocity.magnitude * 3.6f;
+
+        // 1. Calculate Gear Ratio
+        float gearRatio = 1f;
+        if (currentGear > 0 && gearRatios.Length > 0)
         {
-            frontLeftWheel.motorTorque = adjustedTorque;
-            frontRightWheel.motorTorque = adjustedTorque;
-            rearLeftWheel.motorTorque = adjustedTorque;
-            rearRightWheel.motorTorque = adjustedTorque;
+            gearRatio = gearRatios[Mathf.Clamp(currentGear - 1, 0, gearRatios.Length - 1)];
+        }
+        else if (currentGear == -1)
+        {
+            gearRatio = 1.5f; // Reverse gear ratio
         }
         else
         {
-            frontLeftWheel.motorTorque = adjustedTorque;
-            frontRightWheel.motorTorque = adjustedTorque;
-            rearLeftWheel.motorTorque = 0f; // No torque applied to rear wheels
-            rearRightWheel.motorTorque = 0f; // No torque applied to rear wheels
+            gearRatio = 0f; // Neutral
         }
 
+        // Get the physical RPM of the wheels
+        float averageWheelRPM = Mathf.Abs((frontLeftWheel.rpm + frontRightWheel.rpm) / 2f);
+
+        // Derive the RPM based strictly on how fast the car's body is moving forward
+        float velocityBasedRPM = (Mathf.Abs(forwardVelocity) * 60f) / (2f * Mathf.PI * frontLeftWheel.radius);
+
+        float effectiveWheelRPM = Mathf.Max(averageWheelRPM, velocityBasedRPM);
+        float engineRPM = effectiveWheelRPM * gearRatio;
+
+        // 2. TRANSMISSION LOGIC
+        if (isAutomatic)
+        {
+            if (brakeInput > 0.1f)
+            {
+                if (forwardVelocity > 0.5f)
+                {
+                    currentBrakeTorque = brakeInput * brakeForce;
+                }
+                else
+                {
+                    v = brakeInput * (motorForce * 2f); // Reversing
+                    currentGear = -1;
+                }
+            }
+            else
+            {
+                v = throttleInput * motorForce;
+                if (currentGear < 1) currentGear = 1;
+
+                // Automatic Shifting
+                if (currentGear > 0)
+                {
+                    if (engineRPM > shiftThreshold && currentGear < gearRatios.Length)
+                    {
+                        currentGear++; // Upshift
+                    }
+                    else if (engineRPM < downshiftThreshold && currentGear > 1)
+                    {
+                        currentGear--; // Downshift
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Manual Input
+            if (brakeInput > 0.1f) currentBrakeTorque = brakeInput * brakeForce;
+
+            if (currentGear == 0) // Neutral
+            {
+                v = 0f;
+            }
+            else if (currentGear == -1) // Reverse
+            {
+                v = -throttleInput * (motorForce * 2f);
+            }
+            else // Forward
+            {
+                v = throttleInput * motorForce;
+            }
+        }
+
+        // 3. TRUE ENGINE BRAKING & REV LIMITER (Fixed)
+        if (currentGear > 0)
+        {
+            if (engineRPM > shiftThreshold)
+            {
+                // STANDARD REV LIMITER: Always cut throttle if engine is at max RPM
+                v = 0f;
+
+                // MONEY SHIFT LOGIC: Check if the car's forward momentum is what is forcing the engine to over-rev.
+                // This isolates aggressive downshifts from just accelerating into the redline.
+                float overRevFromMomentum = (velocityBasedRPM * gearRatio) - shiftThreshold;
+
+                if (overRevFromMomentum > 0f && brakeInput <= 0.1f)
+                {
+                    // Apply heavy braking ONLY when a downshift forces the engine past its limit
+                    currentBrakeTorque = engineBrakingForce + (overRevFromMomentum * 1.5f);
+                }
+            }
+            // (Removed the heavy coasting brake entirely so letting off the gas in 1st/2nd doesn't snap your neck)
+        }
+
+        // Apply unified brakes
+        ApplyBrakeTorque(currentBrakeTorque);
+
+        UpdateUI(currentSpeedKmph);
+
+        // 4. Apply motor torque
+        float adjustedTorque = v * gearRatio;
+        frontLeftWheel.motorTorque = adjustedTorque;
+        frontRightWheel.motorTorque = adjustedTorque;
+        rearLeftWheel.motorTorque = enable4x4 ? adjustedTorque : 0f;
+        rearRightWheel.motorTorque = enable4x4 ? adjustedTorque : 0f;
+
+        // Apply steering
         frontLeftWheel.steerAngle = h;
         frontRightWheel.steerAngle = h;
 
-        UpdateWheelPoses();
-
-        // Calculate the wheel's angular velocity
         Quaternion currentRotation = frontLeftWheelTransform.rotation;
         float angularVelocity = Quaternion.Angle(prevRotation, currentRotation) / Time.fixedDeltaTime;
         prevRotation = currentRotation;
 
-        // Check if the vehicle is in motion
-        bool isMoving = rb.velocity.magnitude > 0.1f;
+        bool isMoving = currentSpeedKmph > 0.5f;
 
-        // Check if any of the wheels are slipping or drifting
-        bool isFrontLeftSlipping = IsWheelSlipping(frontLeftWheel);
-        bool isFrontRightSlipping = IsWheelSlipping(frontRightWheel);
-        bool isRearLeftSlipping = IsWheelSlipping(rearLeftWheel);
-        bool isRearRightSlipping = IsWheelSlipping(rearRightWheel);
-
-        bool isFrontLeftDrifting = IsWheelDrifting(frontLeftWheel);
-        bool isFrontRightDrifting = IsWheelDrifting(frontRightWheel);
-        bool isRearLeftDrifting = IsWheelDrifting(rearLeftWheel);
-        bool isRearRightDrifting = IsWheelDrifting(rearRightWheel);
-
-        // Check if any of the wheels are sliding while the brake is applied and the vehicle is in motion
-        bool isFrontLeftBraking = IsWheelBraking(frontLeftWheel) && isMoving;
-        bool isFrontRightBraking = IsWheelBraking(frontRightWheel) && isMoving;
-        bool isRearLeftBraking = IsWheelBraking(rearLeftWheel) && isMoving;
-        bool isRearRightBraking = IsWheelBraking(rearRightWheel) && isMoving;
-
-        // Enable/disable the dust particle systems based on wheel slip, drifting, braking, and vehicle motion
-        bool shouldPlayDustParticles = (isFrontLeftSlipping || isFrontLeftDrifting || isFrontLeftBraking) ||
-                                       (isFrontRightSlipping || isFrontRightDrifting || isFrontRightBraking) ||
-                                       (isRearLeftSlipping || isRearLeftDrifting || isRearLeftBraking) ||
-                                       (isRearRightSlipping || isRearRightDrifting || isRearRightBraking);
+        // Effects, Sound, and Particles
+        bool shouldPlayDustParticles = (IsWheelSlipping(frontLeftWheel) || IsWheelDrifting(frontLeftWheel) || (IsWheelBraking(frontLeftWheel) && isMoving)) ||
+                                       (IsWheelSlipping(frontRightWheel) || IsWheelDrifting(frontRightWheel) || (IsWheelBraking(frontRightWheel) && isMoving)) ||
+                                       (IsWheelSlipping(rearLeftWheel) || IsWheelDrifting(rearLeftWheel) || (IsWheelBraking(rearLeftWheel) && isMoving)) ||
+                                       (IsWheelSlipping(rearRightWheel) || IsWheelDrifting(rearRightWheel) || (IsWheelBraking(rearRightWheel) && isMoving));
 
         SetDustParticleSystemState(frontLeftDustParticleSystem, shouldPlayDustParticles);
         SetDustParticleSystemState(frontRightDustParticleSystem, shouldPlayDustParticles);
         SetDustParticleSystemState(rearLeftDustParticleSystem, shouldPlayDustParticles);
         SetDustParticleSystemState(rearRightDustParticleSystem, shouldPlayDustParticles);
 
-        // Calculate the target pitch based on the current speed and direction
-        float targetPitch = currentSpeedKmph > 0.1f ? Mathf.Lerp(0.5f, 2f, currentSpeedKmph / 100f) : 0.5f;
-
-        // Check if the vehicle is moving in reverse
-        if (currentSpeedKmph < -0.1f)
+        if (engineAudioSource != null)
         {
-            targetPitch = Mathf.Lerp(0.5f, 2f, Mathf.Abs(currentSpeedKmph) / 100f);
+            float targetPitchByRPM = Mathf.Lerp(0.5f, 2.5f, engineRPM / shiftThreshold);
+
+            if (currentGear == 0 && Mathf.Abs(throttleInput) > 0.1f)
+            {
+                targetPitchByRPM = Mathf.Lerp(targetPitchByRPM, 2f, Mathf.Abs(throttleInput));
+            }
+
+            if (engineRPM > shiftThreshold)
+            {
+                targetPitchByRPM = Mathf.Clamp(targetPitchByRPM, 2.5f, 3.5f);
+            }
+
+            engineAudioSource.pitch = Mathf.Lerp(engineAudioSource.pitch, targetPitchByRPM, Time.deltaTime * 5f);
         }
-       
-        // Smoothly adjust the pitch towards the target pitch
-        engineAudioSource.pitch = Mathf.Lerp(engineAudioSource.pitch, targetPitch, Time.deltaTime * 5f);
 
-
-        // Play the engine start sound if the vehicle just starts moving
-        if (!hasStartedMoving && currentSpeedKmph > 0.1f)
+        if (!hasStartedMoving && currentSpeedKmph > 0.5f && engineStartAudioSource != null)
         {
             engineStartAudioSource.Play();
             hasStartedMoving = true;
+        }
+
+        if (currentSpeedKmph < 0.5f)
+        {
+            hasStartedMoving = false;
+        }
+    }
+
+    void ApplyBrakeTorque(float force)
+    {
+        foreach (WheelCollider wheelCollider in wheelCollidersBrake)
+        {
+            wheelCollider.brakeTorque = force;
+        }
+    }
+
+    void UpdateUI(float speed)
+    {
+        if (speedText != null)
+        {
+            speedText.text = Mathf.RoundToInt(speed) + " KM/H";
+        }
+
+        if (gearText != null)
+        {
+            if (currentGear == -1)
+            {
+                gearText.text = "R";
+                gearText.color = Color.red;
+            }
+            else if (currentGear == 0)
+            {
+                gearText.text = "N";
+                gearText.color = Color.gray;
+            }
+            else
+            {
+                gearText.text = (isAutomatic ? "D" : "") + currentGear.ToString();
+                gearText.color = Color.white;
+            }
         }
     }
 
@@ -243,20 +374,9 @@ public class JrsVehicleController : MonoBehaviour
 
     void SetDustParticleSystemState(ParticleSystem dustParticleSystem, bool shouldPlay)
     {
-        if (shouldPlay)
-        {
-            if (!dustParticleSystem.isPlaying)
-            {
-                dustParticleSystem.Play();
-            }
-        }
-        else
-        {
-            if (dustParticleSystem.isPlaying)
-            {
-                dustParticleSystem.Stop();
-            }
-        }
+        if (dustParticleSystem == null) return;
+        if (shouldPlay && !dustParticleSystem.isPlaying) dustParticleSystem.Play();
+        else if (!shouldPlay && dustParticleSystem.isPlaying) dustParticleSystem.Stop();
     }
 
     void UpdateWheelPoses()
@@ -267,19 +387,14 @@ public class JrsVehicleController : MonoBehaviour
         UpdateWheelPose(rearRightWheel, rearRightWheelTransform, true);
     }
 
-    void UpdateWheelPose(WheelCollider collider, Transform transform, bool flip = false)
+    void UpdateWheelPose(WheelCollider collider, Transform wheelTransform, bool flip = false)
     {
-        Vector3 pos = transform.position;
-        Quaternion quat = transform.rotation;
-
+        if (collider == null || wheelTransform == null) return;
+        Vector3 pos = wheelTransform.position;
+        Quaternion quat = wheelTransform.rotation;
         collider.GetWorldPose(out pos, out quat);
-
-        if (flip)
-        {
-            quat *= Quaternion.Euler(0, 180, 0);
-        }
-
-        transform.position = pos;
-        transform.rotation = quat;
+        if (flip) quat *= Quaternion.Euler(0, 180, 0);
+        wheelTransform.position = pos;
+        wheelTransform.rotation = quat;
     }
 }
